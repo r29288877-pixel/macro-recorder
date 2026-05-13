@@ -8,7 +8,7 @@ chmod +x gradlew
 ./gradlew clean assembleDebug
 
 if [ $? -eq 0 ]; then
-    APK_PATH="app/build/outputs/apk/release/app-release.apk"
+    APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
     echo ""
     echo "✅ 打包成功！"
     echo "📦 APK 位置：$APK_PATH"
