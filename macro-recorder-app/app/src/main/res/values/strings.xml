@@ -1,5 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="app_name">Macro Recorder</string>
-    <string name="accessibility_service_description">Macro Recorder 需要此權限來模擬觸控操作，用於自動重複播放您錄製的手機操作序列。此服務不會收集任何個人資料。</string>
-</resources>
