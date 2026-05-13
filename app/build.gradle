@@ -5,7 +5,15 @@ plugins {
 
 android {
     namespace 'com.macrorecorder.app'
-    compileSdk 34
+    compileSdk 34// 1. 先定義簽署配置
+
+    signingConfigs {
+        debug {
+            // 注意：GitHub Actions 環境中路徑可能不同，通常使用相對路徑或預設
+            v1SigningEnabled true
+            v2SigningEnabled true
+        }
+    }
 
     defaultConfig {
         applicationId "com.macrorecorder.app"
