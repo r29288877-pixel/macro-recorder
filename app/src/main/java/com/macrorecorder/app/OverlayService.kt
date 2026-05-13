@@ -8,8 +8,6 @@ import android.os.*
 import android.view.*
 import android.widget.*
 import androidx.core.app.NotificationCompat
-import com.google.gson.Gson
-import kotlin.math.abs
 
 class OverlayService : Service() {
 
@@ -22,20 +20,11 @@ class OverlayService : Service() {
     private lateinit var overlayView: View
     private var isRecording = false
     private var isPlaying   = false
-    private val gson = Gson()
 
     private lateinit var btnRecord: Button
     private lateinit var btnPlay: Button
     private lateinit var btnStop: Button
     private lateinit var tvStatus: TextView
-
-    // ── 透明錄製 overlay（用來攔截觸控，同時穿透給底下的 app）──────────────
-    private var touchOverlay: View? = null
-
-    // Touch tracking
-    private var downX    = 0f
-    private var downY    = 0f
-    private var downTime = 0L
 
     private val statusReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -58,16 +47,16 @@ class OverlayService : Service() {
                     MacroAccessibilityService.ACTION_RECORDED_RESULT -> {
                         val json  = intent.getStringExtra(MacroAccessibilityService.EXTRA_ACTIONS) ?: return@post
                         val count = intent.getIntExtra("count", 0)
-                        if (count > 0) {
-                            isPlaying = true
-                            updateUI()
+                        if (count > 0 && isPlaying) {
                             sendBroadcast(Intent(MacroAccessibilityService.ACTION_PLAY).apply {
                                 putExtra(MacroAccessibilityService.EXTRA_ACTIONS, json)
                                 putExtra(MacroAccessibilityService.EXTRA_REPEAT, 0)
                             })
                             tvStatus.text = "播放中..."
-                        } else {
-                            tvStatus.text = "已停止錄製（0 個動作）"
+                        } else if (!isPlaying) {
+                            // stopRecording 後拿到數量，只更新顯示
+                            tvStatus.text = "已錄製 $count 個動作"
+                            updateUI()
                         }
                     }
                 }
@@ -102,8 +91,6 @@ class OverlayService : Service() {
             .setSmallIcon(android.R.drawable.ic_media_play)
             .build()
 
-    // ── 浮動控制面板 ──────────────────────────────────────────────────────────
-
     private fun setupOverlay() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
@@ -124,7 +111,7 @@ class OverlayService : Service() {
         btnStop   = overlayView.findViewById(R.id.btnStop)
         tvStatus  = overlayView.findViewById(R.id.tvStatus)
 
-        // 拖曳移動
+        // 拖曳移動浮動面板
         var dX = 0f; var dY = 0f
         overlayView.setOnTouchListener { _, event ->
             when (event.action) {
@@ -147,73 +134,14 @@ class OverlayService : Service() {
         updateUI()
     }
 
-    // ── 透明 pass-through 錄製 overlay ────────────────────────────────────────
-    //
-    // 關鍵旗標組合：
-    //   FLAG_NOT_FOCUSABLE         — 不搶輸入焦點
-    //   FLAG_WATCH_OUTSIDE_TOUCH   — 能接收到自身視窗範圍外的觸控
-    //
-    // onTouchListener 回傳 false → 系統繼續把事件分發給底下的視窗（穿透效果）
-    // 我們只在 ACTION_DOWN / ACTION_UP 做記錄，不消費事件。
-
-    private fun addTouchOverlay() {
-        val tp = WindowManager.LayoutParams(
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.MATCH_PARENT,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
-                    WindowManager.LayoutParams.FLAG_WATCH_OUTSIDE_TOUCH,
-            PixelFormat.TRANSPARENT
-        ).apply { gravity = Gravity.TOP or Gravity.START }
-
-        val view = View(this)
-        view.setOnTouchListener { _, event ->
-            handleRecordTouch(event)
-            false   // ← 關鍵：回傳 false，讓事件穿透到底下的 app
-        }
-        windowManager.addView(view, tp)
-        touchOverlay = view
-    }
-
-    private fun removeTouchOverlay() {
-        touchOverlay?.let {
-            try { windowManager.removeView(it) } catch (_: Exception) {}
-        }
-        touchOverlay = null
-    }
-
-    private fun handleRecordTouch(event: MotionEvent) {
-        val svc = MacroAccessibilityService.instance ?: return
-        when (event.action) {
-            MotionEvent.ACTION_DOWN -> {
-                downX = event.rawX; downY = event.rawY
-                downTime = SystemClock.uptimeMillis()
-            }
-            MotionEvent.ACTION_UP -> {
-                val now      = SystemClock.uptimeMillis()
-                val dx       = abs(event.rawX - downX)
-                val dy       = abs(event.rawY - downY)
-                val duration = now - downTime
-                when {
-                    dx > 30 || dy > 30 ->
-                        svc.recordTouch(ActionType.SWIPE, downX, downY, event.rawX, event.rawY, duration)
-                    duration > 400 ->
-                        svc.recordTouch(ActionType.LONG_PRESS, downX, downY, duration = duration)
-                    else ->
-                        svc.recordTouch(ActionType.TAP, downX, downY)
-                }
-            }
-        }
-    }
-
     // ── 錄製控制 ──────────────────────────────────────────────────────────────
+    // 不再有任何透明 overlay！
+    // 錄製完全由 MacroAccessibilityService.onMotionEvent() 處理。
 
     private fun startRecording() {
         isRecording = true
         MacroAccessibilityService.isRecording = true
-        // 先清空之前的錄製
         sendBroadcast(Intent(MacroAccessibilityService.ACTION_CLEAR_RECORDED))
-        addTouchOverlay()
         updateUI()
         tvStatus.text = "錄製中...點擊螢幕操作"
     }
@@ -221,17 +149,16 @@ class OverlayService : Service() {
     private fun stopRecording() {
         isRecording = false
         MacroAccessibilityService.isRecording = false
-        removeTouchOverlay()
         updateUI()
-        // 向 AccessibilityService 拿已錄製的清單，只更新顯示計數
         sendBroadcast(Intent(MacroAccessibilityService.ACTION_GET_RECORDED))
-        tvStatus.text = "停止錄製中..."
     }
 
     private fun startPlayingFromRecorded() {
         if (isPlaying) return
+        isPlaying = true
+        updateUI()
+        tvStatus.text = "準備播放..."
         sendBroadcast(Intent(MacroAccessibilityService.ACTION_GET_RECORDED))
-        // 結果回來後在 statusReceiver 的 ACTION_RECORDED_RESULT 裡處理
     }
 
     private fun stopPlaying() {
@@ -250,7 +177,6 @@ class OverlayService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         isRunning = false
-        removeTouchOverlay()
         try { windowManager.removeView(overlayView) } catch (_: Exception) {}
         try { unregisterReceiver(statusReceiver) } catch (_: Exception) {}
     }
