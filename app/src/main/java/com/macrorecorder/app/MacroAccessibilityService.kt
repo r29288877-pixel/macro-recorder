@@ -1,6 +1,7 @@
 package com.macrorecorder.app
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.content.BroadcastReceiver
 import android.content.Context
@@ -10,35 +11,41 @@ import android.graphics.Path
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.view.MotionEvent
 import android.view.accessibility.AccessibilityEvent
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
+import kotlin.math.abs
 
 class MacroAccessibilityService : AccessibilityService() {
 
     companion object {
-        const val ACTION_PLAY          = "com.macrorecorder.PLAY"
-        const val ACTION_STOP          = "com.macrorecorder.STOP"
-        const val ACTION_GET_RECORDED  = "com.macrorecorder.GET_RECORDED"
+        const val ACTION_PLAY            = "com.macrorecorder.PLAY"
+        const val ACTION_STOP            = "com.macrorecorder.STOP"
+        const val ACTION_GET_RECORDED    = "com.macrorecorder.GET_RECORDED"
         const val ACTION_RECORDED_RESULT = "com.macrorecorder.RECORDED_RESULT"
-        const val ACTION_CLEAR_RECORDED = "com.macrorecorder.CLEAR_RECORDED"
-        const val EXTRA_ACTIONS        = "actions"
-        const val EXTRA_REPEAT         = "repeat"
+        const val ACTION_CLEAR_RECORDED  = "com.macrorecorder.CLEAR_RECORDED"
+        const val EXTRA_ACTIONS          = "actions"
+        const val EXTRA_REPEAT           = "repeat"
 
         var instance: MacroAccessibilityService? = null
         var isPlaying   = false
         var isRecording = false
     }
 
-    private val handler = Handler(Looper.getMainLooper())
-    private var repeatCount    = 1
-    private var currentRepeat  = 0
+    private val handler       = Handler(Looper.getMainLooper())
+    private var repeatCount   = 1
+    private var currentRepeat = 0
     private var actions: List<MacroAction> = emptyList()
     private val gson = Gson()
 
-    // 錄製用的資料
+    // 錄製用
     private val recordedActions = mutableListOf<MacroAction>()
     private var lastEventTime   = 0L
+    private var downX = 0f;  private var downY = 0f
+    private var downTime = 0L
+
+    // ── BroadcastReceiver ────────────────────────────────────────────────────
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -46,10 +53,10 @@ class MacroAccessibilityService : AccessibilityService() {
                 ACTION_PLAY -> {
                     val json = intent.getStringExtra(EXTRA_ACTIONS) ?: return
                     val type = object : TypeToken<List<MacroAction>>() {}.type
-                    actions      = gson.fromJson(json, type)
-                    repeatCount  = intent.getIntExtra(EXTRA_REPEAT, 1)
+                    actions       = gson.fromJson(json, type)
+                    repeatCount   = intent.getIntExtra(EXTRA_REPEAT, 1)
                     currentRepeat = 0
-                    isPlaying    = true
+                    isPlaying     = true
                     playNext()
                 }
                 ACTION_STOP -> {
@@ -60,10 +67,8 @@ class MacroAccessibilityService : AccessibilityService() {
                     })
                 }
                 ACTION_GET_RECORDED -> {
-                    // OverlayService 要拿錄製結果
-                    val json = gson.toJson(recordedActions)
                     sendBroadcast(Intent(ACTION_RECORDED_RESULT).apply {
-                        putExtra(EXTRA_ACTIONS, json)
+                        putExtra(EXTRA_ACTIONS, gson.toJson(recordedActions))
                         putExtra("count", recordedActions.size)
                     })
                 }
@@ -75,9 +80,18 @@ class MacroAccessibilityService : AccessibilityService() {
         }
     }
 
+    // ── Lifecycle ────────────────────────────────────────────────────────────
+
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
+
+        // 動態啟用 onMotionEvent：需要 FLAG_REQUEST_TOUCH_EXPLORATION_MODE
+        serviceInfo = serviceInfo.also { info ->
+            info.flags = info.flags or
+                    AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE
+        }
+
         val filter = IntentFilter().apply {
             addAction(ACTION_PLAY)
             addAction(ACTION_STOP)
@@ -93,31 +107,48 @@ class MacroAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
-        try { unregisterReceiver(receiver) } catch (e: Exception) {}
+        try { unregisterReceiver(receiver) } catch (_: Exception) {}
     }
 
-    /**
-     * 提供給 OverlayService 呼叫，用來記錄一個觸控動作。
-     * OverlayService 的透明 overlay 收到 touch 後呼叫這個方法，
-     * 然後把事件回傳 false 讓底下的 app 也能收到。
-     */
-    fun recordTouch(
-        type: ActionType,
-        x: Float, y: Float,
-        x2: Float = 0f, y2: Float = 0f,
-        duration: Long = 0L
-    ) {
-        if (!isRecording) return
-        val now = SystemClock.uptimeMillis()
-        val delay = if (recordedActions.isEmpty()) 0L else now - lastEventTime
-        recordedActions.add(MacroAction(type, x, y, x2, y2, duration, delay))
-        lastEventTime = now
+    // ── 核心：onMotionEvent（Android 12+ / API 31+）──────────────────────────
+    //
+    // 這個 callback 在系統層監聽，不需要任何 overlay。
+    // 事件同樣會繼續傳遞給底下的 app，完全不攔截。
+    // 只有在 isRecording = true 時才記錄。
 
-        // 通知 OverlayService 更新計數顯示
-        val ctx = this as Context
-        ctx.sendBroadcast(Intent("com.macrorecorder.RECORD_COUNT").apply {
-            putExtra("count", recordedActions.size)
-        })
+    override fun onMotionEvent(event: MotionEvent) {
+        if (!isRecording) return
+
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX    = event.rawX
+                downY    = event.rawY
+                downTime = SystemClock.uptimeMillis()
+            }
+            MotionEvent.ACTION_UP -> {
+                val now      = SystemClock.uptimeMillis()
+                val dx       = abs(event.rawX - downX)
+                val dy       = abs(event.rawY - downY)
+                val duration = now - downTime
+                val delay    = if (recordedActions.isEmpty()) 0L else now - lastEventTime
+
+                val action = when {
+                    dx > 30 || dy > 30 -> MacroAction(
+                        ActionType.SWIPE, downX, downY, event.rawX, event.rawY, duration, delay
+                    )
+                    duration > 400 -> MacroAction(
+                        ActionType.LONG_PRESS, downX, downY, duration = duration, delay = delay
+                    )
+                    else -> MacroAction(ActionType.TAP, downX, downY, delay = delay)
+                }
+                recordedActions.add(action)
+                lastEventTime = now
+
+                sendBroadcast(Intent("com.macrorecorder.RECORD_COUNT").apply {
+                    putExtra("count", recordedActions.size)
+                })
+            }
+        }
     }
 
     // ── 播放 ─────────────────────────────────────────────────────────────────
