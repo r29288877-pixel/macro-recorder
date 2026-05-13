@@ -17,7 +17,7 @@ android {
     }
 
     defaultConfig {
-        applicationId "com.macrorecorder.app"
+        applicationId "com.macrorecorder.app.test"
         minSdk 24
         targetSdk 33
         versionCode 1
