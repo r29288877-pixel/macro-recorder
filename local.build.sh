@@ -5,7 +5,7 @@
 
 echo "🔨 開始打包 Macro Recorder APK..."
 chmod +x gradlew
-./gradlew assembleDebug
+./gradlew clean assembleDebug
 
 if [ $? -eq 0 ]; then
     APK_PATH="app/build/outputs/apk/release/app-release.apk"
