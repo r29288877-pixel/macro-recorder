@@ -20,6 +20,7 @@ class OverlayService : Service() {
     private lateinit var overlayView: View
     private var isRecording = false
     private var isPlaying   = false
+    private var recordedCount = 0  // 本地記錄錄製數量，供 UI 顯示
 
     private lateinit var btnRecord: Button
     private lateinit var btnPlay: Button
@@ -30,40 +31,40 @@ class OverlayService : Service() {
         override fun onReceive(context: Context, intent: Intent) {
             Handler(Looper.getMainLooper()).post {
                 when (intent.action) {
-                    "com.macrorecorder.STATUS" -> {
-                        val status  = intent.getStringExtra("status")
-                        val current = intent.getIntExtra("current", 0)
-                        val total   = intent.getIntExtra("total", 0)
+
+                    MacroAccessibilityService.ACTION_RECORD_COUNT -> {
+                        recordedCount = intent.getIntExtra(MacroAccessibilityService.EXTRA_COUNT, 0)
+                        tvStatus.text = "錄製中...已記錄 $recordedCount 個"
+                    }
+
+                    MacroAccessibilityService.ACTION_RECORD_STOPPED -> {
+                        // 錄製完成通知（只更新顯示，不觸發播放）
+                        recordedCount = intent.getIntExtra(MacroAccessibilityService.EXTRA_COUNT, 0)
+                        tvStatus.text = "已錄製 $recordedCount 個動作，可按播放"
+                        updateUI()
+                    }
+
+                    MacroAccessibilityService.ACTION_PLAY_STATUS -> {
+                        val status  = intent.getStringExtra(MacroAccessibilityService.EXTRA_STATUS)
+                        val current = intent.getIntExtra(MacroAccessibilityService.EXTRA_CURRENT, 0)
+                        val total   = intent.getIntExtra(MacroAccessibilityService.EXTRA_TOTAL, 0)
                         when (status) {
                             "progress" -> tvStatus.text = "播放中 $current/$total"
-                            "done"     -> { isPlaying = false; updateUI(); tvStatus.text = "完成！" }
-                            "stopped"  -> { isPlaying = false; updateUI(); tvStatus.text = "已停止" }
-                        }
-                    }
-                    "com.macrorecorder.RECORD_COUNT" -> {
-                        val count = intent.getIntExtra("count", 0)
-                        tvStatus.text = "錄製中...已記錄 $count 個"
-                    }
-                    MacroAccessibilityService.ACTION_RECORDED_RESULT -> {
-                        val json  = intent.getStringExtra(MacroAccessibilityService.EXTRA_ACTIONS) ?: return@post
-                        val count = intent.getIntExtra("count", 0)
-                        if (isPlaying) {
-                            // 來自「播放」按鈕：收到動作清單後開始播放
-                            if (count > 0) {
-                                sendBroadcast(Intent(MacroAccessibilityService.ACTION_PLAY).apply {
-                                    putExtra(MacroAccessibilityService.EXTRA_ACTIONS, json)
-                                    putExtra(MacroAccessibilityService.EXTRA_REPEAT, 0)
-                                })
-                                tvStatus.text = "播放中..."
-                            } else {
+                            "done"     -> {
+                                isPlaying = false
+                                updateUI()
+                                tvStatus.text = "播放完成！"
+                            }
+                            "stopped"  -> {
+                                isPlaying = false
+                                updateUI()
+                                tvStatus.text = "已停止"
+                            }
+                            "empty"    -> {
                                 isPlaying = false
                                 updateUI()
                                 tvStatus.text = "沒有錄製的動作"
                             }
-                        } else {
-                            // 來自「停止錄製」：只更新顯示計數
-                            tvStatus.text = "已錄製 $count 個動作"
-                            updateUI()
                         }
                     }
                 }
@@ -79,9 +80,9 @@ class OverlayService : Service() {
         setupOverlay()
 
         val filter = IntentFilter().apply {
-            addAction("com.macrorecorder.STATUS")
-            addAction("com.macrorecorder.RECORD_COUNT")
-            addAction(MacroAccessibilityService.ACTION_RECORDED_RESULT)
+            addAction(MacroAccessibilityService.ACTION_RECORD_COUNT)
+            addAction(MacroAccessibilityService.ACTION_RECORD_STOPPED)
+            addAction(MacroAccessibilityService.ACTION_PLAY_STATUS)
         }
         registerReceiver(statusReceiver, filter, RECEIVER_NOT_EXPORTED)
     }
@@ -97,8 +98,6 @@ class OverlayService : Service() {
             .setContentText("浮動控制面板已啟動")
             .setSmallIcon(android.R.drawable.ic_media_play)
             .build()
-
-    // ── 浮動控制面板（只有小面板，沒有任何全螢幕 overlay）────────────────────
 
     private fun setupOverlay() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -141,13 +140,14 @@ class OverlayService : Service() {
 
         windowManager.addView(overlayView, params)
         updateUI()
+        tvStatus.text = "準備就緒"
     }
 
-    // ── 錄製控制：委託給 AccessibilityService 處理 ────────────────────────────
+    // ── 錄製控制 ──────────────────────────────────────────────────────────────
 
     private fun startRecording() {
         isRecording = true
-        // 通知 AccessibilityService 開始建立 trusted overlay 並錄製
+        recordedCount = 0
         sendBroadcast(Intent(MacroAccessibilityService.ACTION_START_RECORDING))
         updateUI()
         tvStatus.text = "錄製中...點擊螢幕操作"
@@ -155,19 +155,23 @@ class OverlayService : Service() {
 
     private fun stopRecording() {
         isRecording = false
-        // 通知 AccessibilityService 停止錄製並回傳結果
+        // 通知 AccessibilityService 停止錄製；結果透過 ACTION_RECORD_STOPPED 回傳
         sendBroadcast(Intent(MacroAccessibilityService.ACTION_STOP_RECORDING))
         updateUI()
         tvStatus.text = "停止錄製中..."
     }
 
+    // ── 播放控制 ──────────────────────────────────────────────────────────────
+
     private fun startPlayingFromRecorded() {
-        if (isPlaying) return
+        if (isPlaying || isRecording) return
         isPlaying = true
         updateUI()
-        tvStatus.text = "準備播放..."
-        // 向 AccessibilityService 索取錄製結果，收到後在 receiver 裡播放
-        sendBroadcast(Intent(MacroAccessibilityService.ACTION_GET_RECORDED))
+        tvStatus.text = "播放中..."
+        // 直接通知 AccessibilityService 播放已錄製的動作，播一次
+        sendBroadcast(Intent(MacroAccessibilityService.ACTION_PLAY_RECORDED).apply {
+            putExtra(MacroAccessibilityService.EXTRA_REPEAT, 1)
+        })
     }
 
     private fun stopPlaying() {
@@ -179,7 +183,7 @@ class OverlayService : Service() {
     private fun updateUI() {
         btnRecord.text = if (isRecording) "⏹ 停止錄製" else "🔴 開始錄製"
         btnRecord.setBackgroundColor(if (isRecording) Color.RED else Color.DKGRAY)
-        btnPlay.isEnabled = !isRecording && !isPlaying
+        btnPlay.isEnabled = !isRecording && !isPlaying && recordedCount > 0
         btnStop.isEnabled = isPlaying
     }
 
