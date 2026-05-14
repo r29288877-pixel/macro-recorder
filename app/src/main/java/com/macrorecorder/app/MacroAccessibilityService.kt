@@ -1,17 +1,17 @@
 package com.macrorecorder.app
 
 import android.accessibilityservice.AccessibilityService
-import android.accessibilityservice.AccessibilityServiceInfo
 import android.accessibilityservice.GestureDescription
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.graphics.Path
+import android.graphics.PixelFormat
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.view.MotionEvent
+import android.view.*
 import android.view.accessibility.AccessibilityEvent
 import com.google.gson.Gson
 import com.google.gson.reflect.TypeToken
@@ -20,13 +20,15 @@ import kotlin.math.abs
 class MacroAccessibilityService : AccessibilityService() {
 
     companion object {
-        const val ACTION_PLAY            = "com.macrorecorder.PLAY"
-        const val ACTION_STOP            = "com.macrorecorder.STOP"
-        const val ACTION_GET_RECORDED    = "com.macrorecorder.GET_RECORDED"
-        const val ACTION_RECORDED_RESULT = "com.macrorecorder.RECORDED_RESULT"
-        const val ACTION_CLEAR_RECORDED  = "com.macrorecorder.CLEAR_RECORDED"
-        const val EXTRA_ACTIONS          = "actions"
-        const val EXTRA_REPEAT           = "repeat"
+        const val ACTION_PLAY             = "com.macrorecorder.PLAY"
+        const val ACTION_STOP             = "com.macrorecorder.STOP"
+        const val ACTION_GET_RECORDED     = "com.macrorecorder.GET_RECORDED"
+        const val ACTION_RECORDED_RESULT  = "com.macrorecorder.RECORDED_RESULT"
+        const val ACTION_CLEAR_RECORDED   = "com.macrorecorder.CLEAR_RECORDED"
+        const val ACTION_START_RECORDING  = "com.macrorecorder.START_RECORDING"
+        const val ACTION_STOP_RECORDING   = "com.macrorecorder.STOP_RECORDING"
+        const val EXTRA_ACTIONS           = "actions"
+        const val EXTRA_REPEAT            = "repeat"
 
         var instance: MacroAccessibilityService? = null
         var isPlaying   = false
@@ -39,17 +41,38 @@ class MacroAccessibilityService : AccessibilityService() {
     private var actions: List<MacroAction> = emptyList()
     private val gson = Gson()
 
-    // 錄製用
+    // 錄製資料
     private val recordedActions = mutableListOf<MacroAction>()
     private var lastEventTime   = 0L
-    private var downX = 0f;  private var downY = 0f
+    private var downX = 0f
+    private var downY = 0f
     private var downTime = 0L
+
+    // 用來錄製觸控的 TYPE_ACCESSIBILITY_OVERLAY 視窗
+    // 這種視窗是 trusted，不會阻擋觸控事件傳到底下的 app
+    private var touchOverlayView: View? = null
+    private var windowManager: WindowManager? = null
 
     // ── BroadcastReceiver ────────────────────────────────────────────────────
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
+                ACTION_START_RECORDING -> {
+                    recordedActions.clear()
+                    lastEventTime = 0L
+                    isRecording = true
+                    addTouchOverlay()
+                }
+                ACTION_STOP_RECORDING -> {
+                    isRecording = false
+                    removeTouchOverlay()
+                    // 回傳結果給 OverlayService
+                    sendBroadcast(Intent(ACTION_RECORDED_RESULT).apply {
+                        putExtra(EXTRA_ACTIONS, gson.toJson(recordedActions))
+                        putExtra("count", recordedActions.size)
+                    })
+                }
                 ACTION_PLAY -> {
                     val json = intent.getStringExtra(EXTRA_ACTIONS) ?: return
                     val type = object : TypeToken<List<MacroAction>>() {}.type
@@ -85,14 +108,12 @@ class MacroAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         super.onServiceConnected()
         instance = this
-
-        // 動態啟用 onMotionEvent：需要 FLAG_REQUEST_TOUCH_EXPLORATION_MODE
-        serviceInfo = serviceInfo.also { info ->
-            info.flags = info.flags or
-                    AccessibilityServiceInfo.FLAG_REQUEST_TOUCH_EXPLORATION_MODE
-        }
+        // 取得 WindowManager，後面建立 accessibility overlay 用
+        windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
         val filter = IntentFilter().apply {
+            addAction(ACTION_START_RECORDING)
+            addAction(ACTION_STOP_RECORDING)
             addAction(ACTION_PLAY)
             addAction(ACTION_STOP)
             addAction(ACTION_GET_RECORDED)
@@ -107,18 +128,55 @@ class MacroAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
+        removeTouchOverlay()
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
     }
 
-    // ── 核心：onMotionEvent（Android 12+ / API 31+）──────────────────────────
+    // ── TYPE_ACCESSIBILITY_OVERLAY 觸控錄製視窗 ───────────────────────────────
     //
-    // 這個 callback 在系統層監聽，不需要任何 overlay。
-    // 事件同樣會繼續傳遞給底下的 app，完全不攔截。
-    // 只有在 isRecording = true 時才記錄。
+    // 關鍵：TYPE_ACCESSIBILITY_OVERLAY 是 trusted window。
+    // 根據 Android 官方文件，trusted window 不受 Android 12+ 的觸控阻擋規則限制，
+    // 觸控事件會同時傳到底下的 app，不會被攔截。
+    // 完全不需要 FLAG_REQUEST_TOUCH_EXPLORATION_MODE（那個會鎖死畫面）。
 
-    override fun onMotionEvent(event: MotionEvent) {
-        if (!isRecording) return
+    private fun addTouchOverlay() {
+        if (touchOverlayView != null) return
+        val wm = windowManager ?: return
 
+        val params = WindowManager.LayoutParams(
+            WindowManager.LayoutParams.MATCH_PARENT,
+            WindowManager.LayoutParams.MATCH_PARENT,
+            // TYPE_ACCESSIBILITY_OVERLAY：只能從 AccessibilityService context 建立
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            // FLAG_NOT_FOCUSABLE：不搶輸入焦點，不加 FLAG_NOT_TOUCHABLE 才能收到觸控事件
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSPARENT
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+        }
+
+        val view = View(this)
+        // 設定 alpha 為 0，完全透明，視覺上不影響任何畫面
+        view.alpha = 0f
+
+        // setOnTouchListener 回傳 false：事件不被消費，穿透到底下的 app
+        view.setOnTouchListener { _, event ->
+            if (isRecording) handleRecordTouch(event)
+            false // 回傳 false，讓事件繼續傳到底下的 app
+        }
+
+        wm.addView(view, params)
+        touchOverlayView = view
+    }
+
+    private fun removeTouchOverlay() {
+        touchOverlayView?.let {
+            try { windowManager?.removeView(it) } catch (_: Exception) {}
+        }
+        touchOverlayView = null
+    }
+
+    private fun handleRecordTouch(event: MotionEvent) {
         when (event.actionMasked) {
             MotionEvent.ACTION_DOWN -> {
                 downX    = event.rawX

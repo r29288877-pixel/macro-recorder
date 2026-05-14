@@ -47,14 +47,21 @@ class OverlayService : Service() {
                     MacroAccessibilityService.ACTION_RECORDED_RESULT -> {
                         val json  = intent.getStringExtra(MacroAccessibilityService.EXTRA_ACTIONS) ?: return@post
                         val count = intent.getIntExtra("count", 0)
-                        if (count > 0 && isPlaying) {
-                            sendBroadcast(Intent(MacroAccessibilityService.ACTION_PLAY).apply {
-                                putExtra(MacroAccessibilityService.EXTRA_ACTIONS, json)
-                                putExtra(MacroAccessibilityService.EXTRA_REPEAT, 0)
-                            })
-                            tvStatus.text = "播放中..."
-                        } else if (!isPlaying) {
-                            // stopRecording 後拿到數量，只更新顯示
+                        if (isPlaying) {
+                            // 來自「播放」按鈕：收到動作清單後開始播放
+                            if (count > 0) {
+                                sendBroadcast(Intent(MacroAccessibilityService.ACTION_PLAY).apply {
+                                    putExtra(MacroAccessibilityService.EXTRA_ACTIONS, json)
+                                    putExtra(MacroAccessibilityService.EXTRA_REPEAT, 0)
+                                })
+                                tvStatus.text = "播放中..."
+                            } else {
+                                isPlaying = false
+                                updateUI()
+                                tvStatus.text = "沒有錄製的動作"
+                            }
+                        } else {
+                            // 來自「停止錄製」：只更新顯示計數
                             tvStatus.text = "已錄製 $count 個動作"
                             updateUI()
                         }
@@ -91,6 +98,8 @@ class OverlayService : Service() {
             .setSmallIcon(android.R.drawable.ic_media_play)
             .build()
 
+    // ── 浮動控制面板（只有小面板，沒有任何全螢幕 overlay）────────────────────
+
     private fun setupOverlay() {
         windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
 
@@ -111,7 +120,7 @@ class OverlayService : Service() {
         btnStop   = overlayView.findViewById(R.id.btnStop)
         tvStatus  = overlayView.findViewById(R.id.tvStatus)
 
-        // 拖曳移動浮動面板
+        // 拖曳移動面板
         var dX = 0f; var dY = 0f
         overlayView.setOnTouchListener { _, event ->
             when (event.action) {
@@ -134,23 +143,22 @@ class OverlayService : Service() {
         updateUI()
     }
 
-    // ── 錄製控制 ──────────────────────────────────────────────────────────────
-    // 不再有任何透明 overlay！
-    // 錄製完全由 MacroAccessibilityService.onMotionEvent() 處理。
+    // ── 錄製控制：委託給 AccessibilityService 處理 ────────────────────────────
 
     private fun startRecording() {
         isRecording = true
-        MacroAccessibilityService.isRecording = true
-        sendBroadcast(Intent(MacroAccessibilityService.ACTION_CLEAR_RECORDED))
+        // 通知 AccessibilityService 開始建立 trusted overlay 並錄製
+        sendBroadcast(Intent(MacroAccessibilityService.ACTION_START_RECORDING))
         updateUI()
         tvStatus.text = "錄製中...點擊螢幕操作"
     }
 
     private fun stopRecording() {
         isRecording = false
-        MacroAccessibilityService.isRecording = false
+        // 通知 AccessibilityService 停止錄製並回傳結果
+        sendBroadcast(Intent(MacroAccessibilityService.ACTION_STOP_RECORDING))
         updateUI()
-        sendBroadcast(Intent(MacroAccessibilityService.ACTION_GET_RECORDED))
+        tvStatus.text = "停止錄製中..."
     }
 
     private fun startPlayingFromRecorded() {
@@ -158,6 +166,7 @@ class OverlayService : Service() {
         isPlaying = true
         updateUI()
         tvStatus.text = "準備播放..."
+        // 向 AccessibilityService 索取錄製結果，收到後在 receiver 裡播放
         sendBroadcast(Intent(MacroAccessibilityService.ACTION_GET_RECORDED))
     }
 
