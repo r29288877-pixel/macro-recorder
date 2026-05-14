@@ -20,35 +20,28 @@ import kotlin.math.abs
 class MacroAccessibilityService : AccessibilityService() {
 
     companion object {
+        // UI → Service（這些走 explicit broadcast，保留給 OverlayService 發命令用）
         const val ACTION_START_RECORDING = "com.macrorecorder.START_RECORDING"
         const val ACTION_STOP_RECORDING  = "com.macrorecorder.STOP_RECORDING"
-        const val ACTION_PLAY_RECORDED   = "com.macrorecorder.PLAY_RECORDED"   // 播放已錄製的動作
-        const val ACTION_PLAY            = "com.macrorecorder.PLAY"             // 播放指定 json
+        const val ACTION_PLAY_RECORDED   = "com.macrorecorder.PLAY_RECORDED"
         const val ACTION_STOP            = "com.macrorecorder.STOP"
-        const val ACTION_RECORD_COUNT    = "com.macrorecorder.RECORD_COUNT"     // 通知計數更新
-        const val ACTION_RECORD_STOPPED  = "com.macrorecorder.RECORD_STOPPED"   // 錄製結束通知
-        const val ACTION_PLAY_STATUS     = "com.macrorecorder.PLAY_STATUS"      // 播放狀態通知
-        const val EXTRA_ACTIONS          = "actions"
-        const val EXTRA_REPEAT           = "repeat"
-        const val EXTRA_COUNT            = "count"
-        const val EXTRA_STATUS           = "status"
-        const val EXTRA_CURRENT          = "current"
-        const val EXTRA_TOTAL            = "total"
 
         var instance: MacroAccessibilityService? = null
         var isPlaying   = false
         var isRecording = false
+
+        // OverlayService 直接讀這個，不需要廣播
+        val recordedActions = mutableListOf<MacroAction>()
     }
 
     private val handler       = Handler(Looper.getMainLooper())
     private var repeatCount   = 1
     private var currentRepeat = 0
-    private var actions: List<MacroAction> = emptyList()
+    private var playActions: List<MacroAction> = emptyList()
     private val gson = Gson()
 
-    // 錄製資料
-    private val recordedActions = mutableListOf<MacroAction>()
-    private var lastEventTime   = 0L
+    // 錄製計時
+    private var lastEventTime = 0L
     private var downX = 0f
     private var downY = 0f
     private var downTime = 0L
@@ -57,7 +50,7 @@ class MacroAccessibilityService : AccessibilityService() {
     private var touchOverlayView: View? = null
     private var windowManager: WindowManager? = null
 
-    // ── BroadcastReceiver ────────────────────────────────────────────────────
+    // ── BroadcastReceiver（接收 OverlayService 的命令）────────────────────────
 
     private val receiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -73,34 +66,18 @@ class MacroAccessibilityService : AccessibilityService() {
                 ACTION_STOP_RECORDING -> {
                     isRecording = false
                     removeTouchOverlay()
-                    // 通知 OverlayService 錄製已完成，附上計數
-                    sendBroadcast(Intent(ACTION_RECORD_STOPPED).apply {
-                        putExtra(EXTRA_COUNT, recordedActions.size)
-                    })
+                    // 通知 OverlayService 更新 UI（explicit broadcast）
+                    notifyOverlay("record_stopped", recordedActions.size)
                 }
 
                 ACTION_PLAY_RECORDED -> {
-                    // 直接播放已錄製的動作，不需要 GET/RESULT 的來回
                     if (recordedActions.isEmpty()) {
-                        sendBroadcast(Intent(ACTION_PLAY_STATUS).apply {
-                            putExtra(EXTRA_STATUS, "empty")
-                        })
+                        notifyOverlay("play_status", 0, "empty")
                         return
                     }
-                    val repeat = intent.getIntExtra(EXTRA_REPEAT, 1)
-                    actions       = recordedActions.toList()
+                    val repeat = intent.getIntExtra("repeat", 1)
+                    playActions   = recordedActions.toList()
                     repeatCount   = if (repeat <= 0) 1 else repeat
-                    currentRepeat = 0
-                    isPlaying     = true
-                    playNext()
-                }
-
-                ACTION_PLAY -> {
-                    // 播放外部傳入的 json（保留相容性）
-                    val json = intent.getStringExtra(EXTRA_ACTIONS) ?: return
-                    val type = object : TypeToken<List<MacroAction>>() {}.type
-                    actions       = gson.fromJson(json, type)
-                    repeatCount   = intent.getIntExtra(EXTRA_REPEAT, 1).let { if (it <= 0) 1 else it }
                     currentRepeat = 0
                     isPlaying     = true
                     playNext()
@@ -109,12 +86,23 @@ class MacroAccessibilityService : AccessibilityService() {
                 ACTION_STOP -> {
                     isPlaying = false
                     handler.removeCallbacksAndMessages(null)
-                    sendBroadcast(Intent(ACTION_PLAY_STATUS).apply {
-                        putExtra(EXTRA_STATUS, "stopped")
-                    })
+                    notifyOverlay("play_status", 0, "stopped")
                 }
             }
         }
+    }
+
+    // explicit broadcast 給 OverlayService
+    private fun notifyOverlay(type: String, count: Int = 0, status: String = "", current: Int = 0, total: Int = 0) {
+        val intent = Intent("com.macrorecorder.OVERLAY_EVENT").apply {
+            setPackage(packageName)   // explicit → 確保送達，不被 RECEIVER_NOT_EXPORTED 擋住
+            putExtra("type", type)
+            putExtra("count", count)
+            putExtra("status", status)
+            putExtra("current", current)
+            putExtra("total", total)
+        }
+        sendBroadcast(intent)
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────────
@@ -128,9 +116,9 @@ class MacroAccessibilityService : AccessibilityService() {
             addAction(ACTION_START_RECORDING)
             addAction(ACTION_STOP_RECORDING)
             addAction(ACTION_PLAY_RECORDED)
-            addAction(ACTION_PLAY)
             addAction(ACTION_STOP)
         }
+        // OverlayService 發給我們的命令用 explicit，所以這裡用 RECEIVER_NOT_EXPORTED 沒問題
         registerReceiver(receiver, filter, RECEIVER_NOT_EXPORTED)
     }
 
@@ -140,12 +128,12 @@ class MacroAccessibilityService : AccessibilityService() {
     override fun onDestroy() {
         super.onDestroy()
         instance = null
+        recordedActions.clear()
         removeTouchOverlay()
         try { unregisterReceiver(receiver) } catch (_: Exception) {}
     }
 
     // ── TYPE_ACCESSIBILITY_OVERLAY 觸控錄製視窗 ───────────────────────────────
-    // trusted window，觸控事件穿透到底下的 app，不需要 TOUCH_EXPLORATION flag
 
     private fun addTouchOverlay() {
         if (touchOverlayView != null) return
@@ -165,7 +153,7 @@ class MacroAccessibilityService : AccessibilityService() {
         view.alpha = 0f
         view.setOnTouchListener { _, event ->
             if (isRecording) handleRecordTouch(event)
-            false  // 不消費事件，讓底下的 app 正常收到
+            false  // 穿透，不消費事件
         }
 
         wm.addView(view, params)
@@ -205,9 +193,8 @@ class MacroAccessibilityService : AccessibilityService() {
                 recordedActions.add(action)
                 lastEventTime = now
 
-                sendBroadcast(Intent(ACTION_RECORD_COUNT).apply {
-                    putExtra(EXTRA_COUNT, recordedActions.size)
-                })
+                // 通知 OverlayService 更新計數
+                notifyOverlay("record_count", recordedActions.size)
             }
         }
     }
@@ -216,10 +203,10 @@ class MacroAccessibilityService : AccessibilityService() {
 
     private fun playNext() {
         if (!isPlaying) return
-        if (actions.isEmpty()) return
+        if (playActions.isEmpty()) return
 
         var totalDelay = 0L
-        for (action in actions) {
+        for (action in playActions) {
             val delay = totalDelay + action.delay
             totalDelay = delay + action.duration + 50L
             handler.postDelayed({
@@ -231,18 +218,12 @@ class MacroAccessibilityService : AccessibilityService() {
         handler.postDelayed({
             if (!isPlaying) return@postDelayed
             currentRepeat++
-            sendBroadcast(Intent(ACTION_PLAY_STATUS).apply {
-                putExtra(EXTRA_STATUS, "progress")
-                putExtra(EXTRA_CURRENT, currentRepeat)
-                putExtra(EXTRA_TOTAL, repeatCount)
-            })
+            notifyOverlay("play_status", current = currentRepeat, total = repeatCount, status = "progress")
             if (currentRepeat < repeatCount) {
                 playNext()
             } else {
                 isPlaying = false
-                sendBroadcast(Intent(ACTION_PLAY_STATUS).apply {
-                    putExtra(EXTRA_STATUS, "done")
-                })
+                notifyOverlay("play_status", status = "done")
             }
         }, totalDelay + 300L)
     }
